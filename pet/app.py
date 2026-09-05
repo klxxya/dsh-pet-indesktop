@@ -303,7 +303,7 @@ class PetInstance:
         lib = MovieLibrary(
             character_id=character_id,
             prewarm_policy=prewarm,
-            prewarm_enabled=bool(self.config.get("animation_prewarm_enabled", True)),
+            prewarm_enabled=not bool(self.config.get("idle_low_fps_enabled", False)),
         )
         # UI 就绪后统一调度预热：高优先级立即后台跑（带 0~0.05s 错峰），
         # 随机动作池延迟 2s 补全，避免多开启动时 ffmpeg 进程洪峰。
@@ -704,14 +704,19 @@ class PetInstance:
             self.win.refresh_pet_settings()
         self.shell._sync_dynamic_island()
         self.shell._apply_balance_timer()
-        # Phase 1/2：设置保存后按配置同步可选服务（todo 懒启停）与动画预热开关
+        # Phase 1/2：设置保存后按配置同步可选服务（todo 懒启停）与动画预热
         self.shell._sync_todo_service()
         self._sync_animation_prewarm()
         self._refresh_chat_windows()
         _mac_set_dock_icon_visible(bool(self.config.get("show_dock_icon", True)))
 
     def _sync_animation_prewarm(self) -> None:
-        """设置保存后把动画预热开关同步到当前素材库（幂等，PR73 Phase 2）。"""
+        """设置保存后把预热状态同步到当前素材库（幂等）。
+
+        预热开关已并入省电模式（省电 = 闲置降帧 + 不预热）：省电模式开启时
+        关闭后台预热，关闭时恢复。上游 PR73 的独立 animation_prewarm_enabled
+        键已移除（8MB 首帧预算下其省内存的价值主张不成立）。
+        """
         win = self.win
         lib = getattr(win, "lib", None) if win is not None else None
         setter = getattr(lib, "set_prewarm_enabled", None)
@@ -721,7 +726,7 @@ class PetInstance:
         is_visible = getattr(win, "isVisible", None) if win is not None else None
         if callable(is_visible):
             visible = bool(is_visible())
-        setter(bool(self.config.get("animation_prewarm_enabled", True)), visible=visible)
+        setter(not bool(self.config.get("idle_low_fps_enabled", False)), visible=visible)
 
     # ------------------------------------------------------------ 其它窗口级
     def sync_look_to_chat(self, user_text: str, reply: str) -> None:
