@@ -1586,10 +1586,6 @@ class AppShell:
         return menu
 
     def open_todo_panel(self) -> None:
-        """打开待办管理面板（非模态单例；条目增删改即时落盘，PR72）。"""
-        from .todo_panel import TodoPanelDialog
-
-    def open_todo_panel(self) -> None:
         """打开待办管理面板（非模态单例；条目增删改即时落盘）。"""
         from .todo_panel import TodoPanelDialog
 
