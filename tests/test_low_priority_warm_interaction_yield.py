@@ -116,7 +116,12 @@ def _make_lib(tmp_path, monkeypatch, clip_cls=FakeClip, lib_cls=None):
     return lib_cls(asset_dir=videos, prewarm_policy="full")
 
 
-def _wait_until(predicate, timeout=3.0):
+def _wait_until(predicate, timeout=10.0):
+    # CI 预算：本文件是已知的高负载 flake（批10-A3 缩池后让路场景结构性变化），
+    # 预热 worker 由守护线程承载，在 CI 满载/慢 runner 上从「批次认领」到
+    # 「首个 clip 进入 warm_meta / 批次收尾」可能超过 3s 默认预算。断言业务强度
+    # 不变（仍是「最终必须满足 predicate」），只是放宽等待上界；3s 只在本地空的
+    # 高速 runner 上成立。
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():

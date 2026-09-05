@@ -18,7 +18,6 @@ GifClip 基于 QMovie 播放透明 GIF（兼容旧 GIF 路线）。
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 import random
 import threading
 import time
@@ -277,8 +276,14 @@ class MovieLibrary(QObject):
             [*(cats['clicks'] or []), *(cats['turns'] or [])]
             + ([cats['drag']] if cats.get('drag') else [])
         ))
-        low = [n for n in (*(cats['idles'] or []), *(cats['moves'] or []),
-                           *(cats['acts'] or [])) if n not in high]
+        # 低优先级也必须去重（与 high 同构）：build_categories 在无 idle 兜底时
+        # 会把随机动作池里的一个 clip 同时归入 idles 与 acts（Safety fallback），
+        # 若不去重则同一素材在单批里被预热两次（重复拉起 ffmpeg）。dict.fromkeys
+        # 保序去重，绝不改变池构成。批10-A3 缩池后该路径暴露为 CI 负载 flake。
+        low = list(dict.fromkeys(
+            n for n in (*(cats['idles'] or []), *(cats['moves'] or []),
+                        *(cats['acts'] or [])) if n not in high
+        ))
         return high, low
 
     def _warm_objects(
@@ -317,29 +322,53 @@ class MovieLibrary(QObject):
             return
         if generation is None:
             generation = self._warm_generation
-        with ThreadPoolExecutor(max_workers=workers) as ex:
+        n = len(clips)
+        nworkers = max(1, min(workers, n))
 
-            def _warm_meta(clip: object) -> None:
-                if yield_to_interaction and not self._await_interaction_clear(generation):
-                    return
-                if cancelled is not None and cancelled():
-                    return
-                clip.warm_meta()
+        def _run_phase(warm: Callable[[object], None]) -> None:
+            """用自管守护线程跑一个预热阶段（并发达 `nworkers`、逐 clip 让路/代次）。
 
-            list(ex.map(_warm_meta, clips))
-            if self._warm_paused or not include_frames:
-                return  # 窗口已隐藏 / 该批不需要首帧：首帧留到恢复后或首次播放按需进行
+            不用 ``ThreadPoolExecutor`` 上下文管理器 + 连续两次 ``ex.map``：在
+            极重负载下 executor 的 worker 拿到 None 哨兵后会把 ``_shutdown`` 提前
+            置 True 并退出（实测 `BEFORE _warm_first shutdown=True`），导致首帧
+            阶段被整个吞掉、批次被误标完成。这里用显式守护线程 + 锁保护下标推进，
+            语义与 ``ex.map`` 一致（并发 ≤ workers、每个 clip 先让路/代次检查）。
+            """
+            state = {'idx': 0, 'failed': False}
+            state_lock = threading.Lock()
 
-            def _warm_first(clip: object) -> None:
-                if yield_to_interaction and not self._await_interaction_clear(generation):
-                    return
-                if cancelled is not None and cancelled():
-                    return
-                getattr(clip, 'warm_first_frame', lambda: None)()
+            def _work() -> None:
+                while True:
+                    with state_lock:
+                        if state['idx'] >= n:
+                            return
+                        i = state['idx']
+                        state['idx'] += 1
+                    clip = clips[i]
+                    if yield_to_interaction and not self._await_interaction_clear(generation):
+                        continue
+                    if cancelled is not None and cancelled():
+                        continue
+                    try:
+                        warm(clip)
+                    except Exception:
+                        pass  # 单个素材预热失败不拖垮整批（与顶层 try/except 一致）
 
-            # 预解码各动画首帧（QImage 线程安全），首次播放时零阻塞切换，
-            # 避免点击 Q 弹瞬间同步 ffmpeg 解码造成卡顿与旧动画帧残留。
-            list(ex.map(_warm_first, clips))
+            threads = [
+                threading.Thread(target=_work, daemon=True) for _ in range(nworkers)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        _run_phase(lambda c: c.warm_meta())
+        if self._warm_paused or not include_frames:
+            return  # 窗口已隐藏 / 该批不需要首帧：首帧留到恢复后或首次播放按需进行
+
+        # 预解码各动画首帧（QImage 线程安全），首次播放时零阻塞切换，
+        # 避免点击 Q 弹瞬间同步 ffmpeg 解码造成卡顿与旧动画帧残留。
+        _run_phase(lambda c: getattr(c, 'warm_first_frame', lambda: None)())
 
     def _await_interaction_clear(self, generation: int) -> bool:
         """低优先级预热让路：交互进行中阻塞等待，交互结束返回 True 继续。

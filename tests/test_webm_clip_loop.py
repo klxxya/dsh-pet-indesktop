@@ -833,8 +833,16 @@ def test_recycle_at_boundary_retires_process_and_fresh_spawns(app, monkeypatch, 
         assert clip.start() is True
         assert clip._reader_ready.wait(5.0)
         proc, gen = spawns[0][0], spawns[0][1]
-        # 把当前进程「出生时刻」拨回 1200s 前 → 到达圈边界时必已过阈值。
-        clip._reader_born_at = time.monotonic() - 1200.0
+        # 强制「必到期」：不依赖 time.monotonic() 的绝对值。CI（ubuntu+windows）
+        # 托管 runner 常在新启动的实例上跑，此时 time.monotonic()（Linux
+        # CLOCK_MONOTONIC / Windows QPC，均相对系统启动）可能 < 1200s；原先
+        # 「-1200s 回拨」会把 _reader_born_at 算成非正值，触发 _recycle_due()
+        # 的 `_reader_born_at <= 0` 防御守卫 → 回收分支被跳过、reader 改走
+        # 宽限期超时退出，前几条断言（进程死、_thread 清空、三帧交付、finished）
+        # 全通过、唯独 recycle 计数恒为 0。改成极小阈值 + 恒正出生时刻：只要
+        # 进程「已出生」即判定到期（断言强度不变，仍是「回收必须发生」）。
+        clip._recycle_seconds = 0.001
+        clip._reader_born_at = 1.0
         for _ in range(3):
             gen.release()
         # 回收必须完整播完一圈（绝不打断）：三帧全交付 + 结束标记 → finished
@@ -1156,7 +1164,12 @@ def test_thread_none_after_recycle_self_exit(app, monkeypatch, tmp_path):
         assert clip.start() is True
         assert clip._reader_ready.wait(5.0)
         proc, gen = spawns[0][0], spawns[0][1]
-        clip._reader_born_at = time.monotonic() - 1200.0  # 必达回收阈值
+        # 同 test_recycle_at_boundary：不用「-1200s 回拨」（CI 新启动 runner 上
+        # time.monotonic() 可能 <1200s，会算出非正出生时刻触发 _recycle_due 的
+        # <=0 防御 → 回收被跳过、退化成宽限期路径，本测试暗中不再测回收）。改成
+        # 极小阈值 + 恒正出生时刻，保证「必到期」恒成立、真实走回收分支。
+        clip._recycle_seconds = 0.001
+        clip._reader_born_at = 1.0
         for _ in range(3):
             gen.release()
         assert _consume_until(clip, lambda: len(finished) == 1), f"srcs={finished}"
