@@ -303,6 +303,7 @@ class PetInstance:
         lib = MovieLibrary(
             character_id=character_id,
             prewarm_policy=prewarm,
+            prewarm_enabled=bool(self.config.get("animation_prewarm_enabled", True)),
         )
         # UI 就绪后统一调度预热：高优先级立即后台跑（带 0~0.05s 错峰），
         # 随机动作池延迟 2s 补全，避免多开启动时 ffmpeg 进程洪峰。
@@ -357,6 +358,7 @@ class PetInstance:
         win.on_open_legacy_settings = None
         win.on_open_modern_settings = self._slot_wrap(self.open_modern_settings)
         win.on_spawn_pet = self._slot_wrap(self.shell.spawn_pet)
+        win.on_clear_spawned_pets = self._slot_wrap(self.shell.clear_spawned_pets)
         win.on_open_todo_panel = self._slot_wrap(self.shell.open_todo_panel)
         win.on_restore_fun_windows = restore_ojingjing_windows
         win.on_hidden = self._slot_wrap(self._notify_pet_hidden)
@@ -702,9 +704,24 @@ class PetInstance:
             self.win.refresh_pet_settings()
         self.shell._sync_dynamic_island()
         self.shell._apply_balance_timer()
-        self.shell.todo_service.apply_config()
+        # Phase 1/2：设置保存后按配置同步可选服务（todo 懒启停）与动画预热开关
+        self.shell._sync_todo_service()
+        self._sync_animation_prewarm()
         self._refresh_chat_windows()
         _mac_set_dock_icon_visible(bool(self.config.get("show_dock_icon", True)))
+
+    def _sync_animation_prewarm(self) -> None:
+        """设置保存后把动画预热开关同步到当前素材库（幂等，PR73 Phase 2）。"""
+        win = self.win
+        lib = getattr(win, "lib", None) if win is not None else None
+        setter = getattr(lib, "set_prewarm_enabled", None)
+        if not callable(setter):
+            return
+        visible = None
+        is_visible = getattr(win, "isVisible", None) if win is not None else None
+        if callable(is_visible):
+            visible = bool(is_visible())
+        setter(bool(self.config.get("animation_prewarm_enabled", True)), visible=visible)
 
     # ------------------------------------------------------------ 其它窗口级
     def sync_look_to_chat(self, user_text: str, reply: str) -> None:
@@ -816,11 +833,14 @@ class AppShell:
         self._balance_timer.timeout.connect(self.show_balance)
         self._update_bridge = None
         self._balance_cache_path = config.dir / 'balance_cache.json'  # 跨实例共享余额缓存（按 provider 绑定）
-        # 待办提醒：进程级单例（多窗共用一个调度器，避免每窗一个定时器重复通知）。
-        # win 引用在服务 tick 时经本类的 win 属性动态读取主窗，角色热切换重建
-        # 窗口后无需重绑（PR72 上游版挂在 PetApp；本分支进程级功能归 AppShell）。
-        self.todo_service = TodoReminderService(self)
+        # 待办提醒：进程级单例（多窗共用一个调度器，避免每窗一个定时器重复通知），
+        # Phase 1 门控：默认懒创建——配置关闭时不构造、不跑 30s 定时器；关闭且
+        # 无面板打开时释放。win 引用在服务 tick 时经本类 win 属性动态读主窗，
+        # 角色热切换重建窗口后无需重绑（PR72 上游版挂 PetApp；本分支归 AppShell）。
+        self.todo_service = None
         self.todo_panel = None
+        if self._todo_wanted():
+            self._ensure_todo_service()
         # 批5.2 P1-2/P2-6：进程级 flag 快照——启动期从主窗 config 读一次存
         # _single_process_spawn；窗级逻辑（runtime 标记版本化、日志前缀、
         # 退出分派、spawn 分发）一律读本快照，不读每窗 config。第二窗的
@@ -893,6 +913,35 @@ class AppShell:
         inst = getattr(self, 'instance', None)
         return getattr(inst, 'chat_settings_dialog', None) if inst is not None else None
 
+    # ------------------------------------------------------------ 功能门控（待办提醒）
+    def _todo_wanted(self) -> bool:
+        return bool(self.config.get("todo_reminder_enabled", True))
+
+    def _ensure_todo_service(self):
+        """懒创建待办提醒服务（仅在使用待办/打开面板时创建）。"""
+        if getattr(self, "todo_service", None) is None:
+            self.todo_service = TodoReminderService(self)
+        return self.todo_service
+
+    def _sync_todo_service(self) -> None:
+        """按配置启停待办提醒服务；关闭且无面板打开时释放服务对象。"""
+        if self._todo_wanted():
+            service = self._ensure_todo_service()
+            timer = getattr(service, "_timer", None)
+            if timer is not None and callable(getattr(timer, "isActive", None)) and timer.isActive():
+                # 已在运行：设置保存只刷新偏好/条目，不重置 30s tick。
+                service.apply_config()
+            elif callable(getattr(service, "start", None)):
+                service.start()
+        elif getattr(self, "todo_service", None) is not None:
+            try:
+                self.todo_service.stop()
+            except Exception:
+                logging.exception("停止待办提醒服务失败")
+            # 面板持有 app 引用并动态读取 todo_service；面板还开着时保留对象。
+            if getattr(self, "todo_panel", None) is None:
+                self.todo_service = None
+
     # ------------------------------------------------------------ 启动
     def start(self) -> None:
         # aboutToQuit 只在控制器层绑定一次：角色热切换会重建窗口，逐个
@@ -913,7 +962,7 @@ class AppShell:
         self._sync_dynamic_island()
         self.instance._apply_spawn_offset()
         self._apply_balance_timer()
-        self.todo_service.start()
+        self._sync_todo_service()
         QTimer.singleShot(3500, self.instance._check_autostart_wanted)
 
     # ------------------------------------------------------------ 退出收口
@@ -1263,6 +1312,28 @@ class AppShell:
             logging.exception('进程内生成小肥鱼失败')
             _show_startup_error('生小肥鱼失败', str(exc))
 
+    def clear_spawned_pets(self) -> None:
+        """右键菜单快捷入口：确认后关闭所有小肥鱼并删除 slot 数据。"""
+        from .child_pet_cleanup import clear_spawned_pets as cleanup_slots
+
+        parent = self.win if self.win is not None and hasattr(self.win, "winId") else None
+        answer = QMessageBox.question(
+            parent,
+            "清除子肥鱼",
+            "将关闭所有已生成的小肥鱼，并删除它们的配置、会话与待办数据。\n\n此操作不可撤销，确定继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        result = cleanup_slots(self.config.dir)
+        QMessageBox.information(
+            parent,
+            "清除子肥鱼",
+            f"已关闭 {len(result['killed_pids'])} 个小肥鱼进程，"
+            f"并清除 {len(result['deleted'])} 个 slot 数据项。",
+        )
+
     def spawn_in_process_window(self, offset_index: int = 1) -> PetInstance:
         """批5.2 spike：进程内创建第二个 PetInstance（不共享库/Config/SessionStore）。
 
@@ -1518,6 +1589,12 @@ class AppShell:
         """打开待办管理面板（非模态单例；条目增删改即时落盘，PR72）。"""
         from .todo_panel import TodoPanelDialog
 
+    def open_todo_panel(self) -> None:
+        """打开待办管理面板（非模态单例；条目增删改即时落盘）。"""
+        from .todo_panel import TodoPanelDialog
+
+        # Phase 1：即使总开关关闭，用户主动打开面板也需要服务对象（懒创建）。
+        self._ensure_todo_service()
         if self.todo_panel is None:
             dialog = TodoPanelDialog(self, parent=self.win)
             dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)

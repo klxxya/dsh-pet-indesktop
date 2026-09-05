@@ -436,9 +436,11 @@ def test_petapp_settings_finish_applies_todo_prefs(tmp_path, monkeypatch):
     owner._refresh_chat_windows = lambda: None
     # 本分支 todo_service 是进程级单例，挂在 AppShell 上
     owner.shell.todo_service = TodoReminderService(owner.shell)
+    owner.shell.todo_panel = None
     owner.config.set("todo_reminder_enabled", False)
     PetInstance._modern_settings_finished(owner, 0)
-    assert owner.shell.todo_service._prefs["enabled"] is False
+    # Phase 1 门控：待办总开关关闭且无面板打开时，服务对象应被释放
+    assert owner.shell.todo_service is None
 
 
 # ------------------------------------------------------------ 管理面板

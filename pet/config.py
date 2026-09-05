@@ -518,6 +518,9 @@ class Config:
             else self.dir / "config.json"
         )
         self._migrate_legacy_config(base)
+        fresh_spawn = os.environ.get("DSH_PET_SPAWN_FRESH") == "1"
+        if self.instance_id and (not self.path.exists() or fresh_spawn):
+            self._seed_slot_config_from_main(force=fresh_spawn)
         self.data = {
             "version": 4,
             "rx": None,
@@ -525,6 +528,9 @@ class Config:
             "screen_name": None,
             "facing": "left",
             "scale": catalog.DEFAULT_SCALE,
+            "spawn_inherit_size": True,  # 生小肥鱼继承主肥鱼大小（False 用 spawn_scale）
+            "spawn_scale": catalog.DEFAULT_SCALE,  # 关闭继承时生小肥鱼使用的尺寸
+            "spawn_inherit_dynamic_island": False,  # 生小肥鱼继承主肥鱼灵动岛（默认关=不开灵动岛）
             "on_top": True,
             "show_dock_icon": True,
             "no_move": False,
@@ -560,6 +566,7 @@ class Config:
             "throw_max_speed": 4800.0,     # 由 throw_strength 导出
             "idle_low_fps_enabled": False,  # 闲置降帧（灰度默认关）：长时间无交互时动画隔帧呈现
             "idle_low_fps_threshold": 30.0,  # 闲置阈值（秒）：超过该时长无交互且窗口可见才降帧
+            "animation_prewarm_enabled": True,  # 动画预热（默认开）：预载高频/随机动作首帧以换流畅；关闭省内存
             "click_show_balance": False,   # 点击显示 DeepSeek 余额
             "click_show_self_talk": False, # 点击随机显示自定义自言自语
             "balance_refresh_minutes": 0,  # DeepSeek 余额自动刷新间隔（分钟，0=关闭）
@@ -635,6 +642,72 @@ class Config:
         except OSError:
             pass
 
+    def _seed_slot_config_from_main(self, *, force: bool = False) -> None:
+        """新建副槽时继承主配置（issue #69-6），避免“生小肥鱼恢复默认设置”。
+
+        只在该槽位还没有个体配置文件、或本次是通过“生小肥鱼”显式孵化的
+        新进程（DSH_PET_SPAWN_FRESH=1）时执行；普通重启已有 slot-N 配置
+        仍保持独立记忆。复制主 config.json 后做副槽化处理：位置回到自动
+        摆放、开机自启仍只归主槽所有。写盘副本沿用主配置的脱敏策略，
+        不把明文 API Key 复制进副槽。
+        """
+        main_path = self.dir / "config.json"
+        if (not force and self.path.exists()) or not main_path.is_file():
+            return
+        try:
+            raw = json.loads(main_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(raw, dict):
+            return
+        seed = copy.deepcopy(raw)
+        seed["version"] = 4
+        # 副槽不继承主桌宠的位置/屏幕，避免新鱼叠在旧鱼身上；自启仍仅主槽。
+        seed["rx"] = None
+        seed["ry"] = None
+        seed["screen_name"] = None
+        seed["autostart_wanted"] = False
+        # 生小肥鱼大小策略：开启继承 → 保留主配置 scale；
+        # 关闭继承 → 用主配置里给“小肥鱼”单独选择的 spawn_scale。
+        inherit_size = _bool_or_default(seed.get("spawn_inherit_size"), True)
+        seed["spawn_inherit_size"] = inherit_size
+        if not inherit_size:
+            try:
+                seed["scale"] = float(seed.get("spawn_scale", catalog.DEFAULT_SCALE))
+            except (TypeError, ValueError):
+                seed["scale"] = catalog.DEFAULT_SCALE
+        # 生小肥鱼灵动岛策略：默认不继承 → 小肥鱼不开启自己的灵动岛；
+        # 开启继承 → 保留主配置的 dynamic_island（含是否启用）。
+        inherit_island = _bool_or_default(seed.get("spawn_inherit_dynamic_island"), False)
+        seed["spawn_inherit_dynamic_island"] = inherit_island
+        island = seed.get("dynamic_island")
+        if isinstance(island, dict):
+            island["enabled"] = bool(inherit_island)
+        else:
+            seed["dynamic_island"] = {"enabled": bool(inherit_island)}
+        chat = seed.get("chat")
+        if isinstance(chat, dict):
+            providers = chat.get("providers")
+            if isinstance(providers, dict):
+                for provider in providers.values():
+                    if isinstance(provider, dict):
+                        provider.pop("api_key", None)
+                        provider.pop("vision_api_key", None)
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            temp = self.path.with_name(f"{self.path.name}.{os.getpid()}.seed.tmp")
+            temp.write_text(
+                json.dumps(seed, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(temp, self.path)
+        except OSError as exc:
+            logging.warning("从主配置播种副槽配置失败: %s (%s)", self.path, exc)
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def reload(self):
         if not self.path.is_file():
             return
@@ -703,6 +776,7 @@ class Config:
                         merged_provider["vision_api_key"] = previous_provider["vision_api_key"]
         for key in (
             "rx", "ry", "screen_name", "facing", "scale", "on_top", "show_dock_icon", "no_move", "character",
+            "spawn_inherit_size", "spawn_scale", "spawn_inherit_dynamic_island",
             "playback_speed", "animation_gap_seconds", "self_talk_enabled",
             "self_talk_min_interval", "self_talk_max_interval", "self_talk_texts",
             "self_talk_duration_seconds", "self_talk_image_dir",
@@ -717,6 +791,7 @@ class Config:
             "click_sound_pack", "click_sound_volume",
             "slingshot_enabled", "throw_strength", "throw_max_speed",
             "idle_low_fps_enabled", "idle_low_fps_threshold",
+            "animation_prewarm_enabled",
             "click_show_balance", "click_show_self_talk",
             "balance_refresh_minutes", "autostart_wanted", "stream_capture_mode",
             "music_sing_enabled",
@@ -754,6 +829,42 @@ class Config:
         self._migrate_click_sound_config(raw)
         self._migrate_decode_broker_config(raw)
         self.data["version"] = 4
+        self._migrate_plaintext_keys_to_keyring()
+
+    def _migrate_plaintext_keys_to_keyring(self) -> None:
+        """加载时把磁盘遗留的明文 API Key 迁移进 keyring。
+
+        v4.0.4/4.0.5 起 _redacted_data() 写盘时剔除 chat.providers 下的明文
+        api_key/vision_api_key，但 SecretStore.set 只在设置对话框保存时调用——
+        老版本（≤v4.0.0）磁盘上的明文 key 从未进过 keyring，升级后首次写盘即被剔除，
+        重启后 resolve_api_key 拿不到任何值，聊天/视觉 401 静默失效。
+        此处补迁移：keyring 已有值不覆盖（与 resolve_api_key 的 keyring 优先序一致），
+        仅丢弃明文；set 失败（keyring 不可用）保留内存明文，维持原兜底行为。
+        幂等：迁移成功后内存/磁盘均无明文，重复 reload 无副作用；不主动 save()，
+        写盘剔除交给下次正常保存。
+        """
+        chat = self.data.get("chat")
+        providers = chat.get("providers") if isinstance(chat, dict) else None
+        if not isinstance(providers, dict):
+            return
+        from .chat.models import SecretStore  # 惰性导入，且只实例化一次
+        store = SecretStore()
+        for provider_id, provider in providers.items():
+            if not isinstance(provider, dict):
+                continue
+            for key_field, ref_field, default_ref in (
+                ("api_key", "api_key_ref", f"provider/{provider_id}"),
+                ("vision_api_key", "vision_api_key_ref", f"provider/{provider_id}/vision"),
+            ):
+                plaintext = str(provider.get(key_field) or "")
+                if not plaintext.strip():
+                    continue
+                ref = str(provider.get(ref_field) or "").strip()
+                if not ref:
+                    ref = default_ref
+                    provider[ref_field] = ref
+                if store.get(ref) or store.set(ref, plaintext):
+                    provider.pop(key_field, None)
 
     def _migrate_click_sound_config(self, raw: dict) -> None:
         """旧版 click_sound_path 迁移为 click_sound_pack。"""
@@ -817,6 +928,15 @@ class Config:
         self.data["cursor_hidden_passthrough"] = _bool_or_default(
             self.data.get("cursor_hidden_passthrough"), True
         )
+        self.data["spawn_inherit_size"] = _bool_or_default(
+            self.data.get("spawn_inherit_size"), True
+        )
+        self.data["spawn_scale"] = _float_or_default(
+            self.data.get("spawn_scale"), catalog.DEFAULT_SCALE, 0.1, 4.0
+        )
+        self.data["spawn_inherit_dynamic_island"] = _bool_or_default(
+            self.data.get("spawn_inherit_dynamic_island"), False
+        )
         self.data["show_dock_icon"] = bool(self.data.get("show_dock_icon", True))
         self.data["self_talk_texts"] = _clean_self_talk_texts(self.data.get("self_talk_texts"))
         bubble_style = str(self.data.get("self_talk_bubble_style") or "")
@@ -879,6 +999,10 @@ class Config:
         )
         self.data["idle_low_fps_threshold"] = _float_or_default(
             self.data.get("idle_low_fps_threshold"), 30.0, 1.0, 3600.0
+        )
+        # 动画预热（Phase 2，默认开）：关闭后不再后台预载大量动画首帧。
+        self.data["animation_prewarm_enabled"] = _bool_or_default(
+            self.data.get("animation_prewarm_enabled"), True
         )
         # 上游 #60 系统通知开关：同规防字符串布尔误开（bool("false") is True）。
         self.data["system_notifications_enabled"] = _bool_or_default(
@@ -990,6 +1114,8 @@ class Config:
             "idle_low_fps_enabled", "idle_low_fps_threshold",
             "media_prewarm", "first_frame_cache_max_mb", "predict_prewarm_lead_ms",
             "ffmpeg_recycle_minutes",
+            "animation_prewarm_enabled",
+            "spawn_inherit_size", "spawn_scale", "spawn_inherit_dynamic_island",
             "todo_reminder_enabled", "todo_reminder_lead_minutes",
             "character_profiles", "chat_always_on_top", "dynamic_island",
         }:
