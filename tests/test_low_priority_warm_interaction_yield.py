@@ -69,7 +69,11 @@ class BlockableClip(FakeClip):
         self.meta_calls += 1
         self.warmed_meta = True
         self.meta_entered.set()
-        self.meta_release.wait(5.0)
+        # CI 慢 runner 上，从 meta_entered 到测试完成编舞步骤（begin_interaction、
+        # 打闸门补丁、放行）可能超过 5s；放行前超时会让 worker 先行通过闸门，
+        # 破坏「让路/放弃」断言。放宽到 30s：正常路径由测试显式放行，超时只是
+        # 防挂死兜底。
+        self.meta_release.wait(30.0)
 
 
 class _GateObjectsLib(library_mod.MovieLibrary):
@@ -116,12 +120,12 @@ def _make_lib(tmp_path, monkeypatch, clip_cls=FakeClip, lib_cls=None):
     return lib_cls(asset_dir=videos, prewarm_policy="full")
 
 
-def _wait_until(predicate, timeout=10.0):
+def _wait_until(predicate, timeout=30.0):
     # CI 预算：本文件是已知的高负载 flake（批10-A3 缩池后让路场景结构性变化），
     # 预热 worker 由守护线程承载，在 CI 满载/慢 runner 上从「批次认领」到
-    # 「首个 clip 进入 warm_meta / 批次收尾」可能超过 3s 默认预算。断言业务强度
-    # 不变（仍是「最终必须满足 predicate」），只是放宽等待上界；3s 只在本地空的
-    # 高速 runner 上成立。
+    # 「首个 clip 进入 warm_meta / 批次收尾」可能超过 10s（实测本地重载机也会
+    # 偶发超 10s）。断言业务强度不变（仍是「最终必须满足 predicate」），只放宽
+    # 等待上界。
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -231,8 +235,12 @@ def test_no_busy_loop_while_waiting_gate(tmp_path, monkeypatch):
 
 def test_low_warm_waits_while_interaction_active_then_resumes(tmp_path, monkeypatch):
     lib = _make_lib(tmp_path, monkeypatch, BlockableClip)
+    # CI 顺序无关：低优池顺序来自目录枚举，Linux/Windows 不同（ubuntu CI 上
+    # 「吃白饭」可能排在「写代码」前）——按真实池顺序取前两个，编舞语义不变。
+    _, low = lib._priority_names()
+    first, second = low[0], low[1]
     lib._warm_low_priority_background()  # 非交互状态启动批次
-    _wait_until(lambda: lib._movies["写代码"].meta_entered.is_set())
+    _wait_until(lambda: lib._movies[first].meta_entered.is_set())
 
     lib.begin_interaction()
     # 观测第二个 clip 前的让路闸门：worker 放行第一个 clip 后应阻塞在此
@@ -244,17 +252,17 @@ def test_low_warm_waits_while_interaction_active_then_resumes(tmp_path, monkeypa
         return orig_gate(generation)
 
     lib._await_interaction_clear = gated
-    lib._movies["写代码"].meta_release.set()  # 放行第一个 clip
+    lib._movies[first].meta_release.set()  # 放行第一个 clip
     _wait_until(gate_entered.is_set)  # 事件同步确定 worker 已进入闸门（不猜时序）
-    assert lib._movies["吃白饭"].warmed_meta is False, "交互中低优先级预热必须让路"
+    assert lib._movies[second].warmed_meta is False, "交互中低优先级预热必须让路"
 
     # 放行第二个 clip 的阻塞再结束交互：worker 立即完成，不留在飞线程
-    lib._movies["吃白饭"].meta_release.set()
+    lib._movies[second].meta_release.set()
     lib.end_interaction()
     _wait_until(lambda: lib._low_first_frames_done)
-    assert lib._movies["吃白饭"].warmed_meta is True
-    assert lib._movies["吃白饭"].warmed_frame is True
-    assert lib._movies["写代码"].warmed_frame is True
+    assert lib._movies[second].warmed_meta is True
+    assert lib._movies[second].warmed_frame is True
+    assert lib._movies[first].warmed_frame is True
 
 
 def test_low_warm_batch_dedup_in_flight(tmp_path, monkeypatch):
@@ -313,25 +321,28 @@ def test_completed_flag_stable_after_completion(tmp_path, monkeypatch):
 
 def test_pause_warm_aborts_stale_batch_no_revival(tmp_path, monkeypatch):
     lib = _make_lib(tmp_path, monkeypatch, BlockableClip)
+    # CI 顺序无关：低优池顺序来自目录枚举（平台相关），按真实池顺序取前两个
+    _, low = lib._priority_names()
+    first, second = low[0], low[1]
     lib._warm_low_priority_background()
-    _wait_until(lambda: lib._movies["写代码"].meta_entered.is_set())
+    _wait_until(lambda: lib._movies[first].meta_entered.is_set())
 
     lib.begin_interaction()  # 拖拽中
-    lib._movies["写代码"].meta_release.set()
+    lib._movies[first].meta_release.set()
     lib.pause_warm()  # 隐藏/切角色：代次作废旧批次
     lib.end_interaction()  # 旧窗口迟到的松手事件：不得复活旧预热
 
     _wait_until(lambda: not lib._low_warm_in_flight)  # 旧 worker 真正收尾（不猜时序）
-    assert lib._movies["吃白饭"].warmed_meta is False, "旧代次批次必须放弃，不得复活"
+    assert lib._movies[second].warmed_meta is False, "旧代次批次必须放弃，不得复活"
     assert lib._low_first_frames_done is False
 
     # 恢复显示后重新排期：新代次批次完整跑完
     lib.resume_warm()
-    lib._movies["吃白饭"].meta_release.set()  # 新批次遇到阻塞 clip 时直接放行
+    lib._movies[second].meta_release.set()  # 新批次遇到阻塞 clip 时直接放行
     lib._warm_low_priority_background()
     _wait_until(lambda: lib._low_first_frames_done)
-    assert lib._movies["吃白饭"].warmed_meta is True
-    assert lib._movies["吃白饭"].warmed_frame is True
+    assert lib._movies[second].warmed_meta is True
+    assert lib._movies[second].warmed_frame is True
 
 
 def test_fast_pause_resume_aborts_batch_via_captured_generation(tmp_path, monkeypatch):
