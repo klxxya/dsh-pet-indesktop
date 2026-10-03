@@ -71,18 +71,18 @@ jobs:
 
       # DIAG v2：mac 只跑 trio（崩点组合）——快迭代钉崩点
       - name: Pytest (mac trio only, verbose)
-        if: matrix.os == 'macos-latest'
+        if: always() && matrix.os == 'macos-latest'
         run: python -m pytest -v tests/test_overlay_spawn.py tests/test_overlay_lifecycle_gaps.py tests/test_sprite_visibility.py
 
       # DIAG v3：崩溃簇内消融——各拆一条嫌疑用例（独立进程互不影响）
       - name: Pytest (mac trio minus K3 poison test)
-        if: matrix.os == 'macos-latest'
+        if: always() && matrix.os == 'macos-latest'
         run: python -m pytest -v tests/test_overlay_spawn.py tests/test_overlay_lifecycle_gaps.py tests/test_sprite_visibility.py --deselect tests/test_sprite_visibility.py::test_unbind_while_paused_does_not_poison_clip_for_next_bind || echo "DIAG-ARM1-EXIT=$?"
       - name: Pytest (mac trio minus pause pair)
-        if: matrix.os == 'macos-latest'
+        if: always() && matrix.os == 'macos-latest'
         run: python -m pytest -v tests/test_overlay_spawn.py tests/test_overlay_lifecycle_gaps.py tests/test_sprite_visibility.py --deselect tests/test_sprite_visibility.py::test_pause_clip_stops_timer_and_resume_continues_without_rewind --deselect tests/test_sprite_visibility.py::test_pause_clip_is_idempotent_and_noop_without_clip || echo "DIAG-ARM2-EXIT=$?"
       - name: Pytest (mac trio minus DS2 visibility tests)
-        if: matrix.os == 'macos-latest'
+        if: always() && matrix.os == 'macos-latest'
         run: python -m pytest -v tests/test_overlay_spawn.py tests/test_overlay_lifecycle_gaps.py tests/test_sprite_visibility.py --deselect tests/test_sprite_visibility.py::test_sprite_show_while_window_hidden_keeps_real_clip_paused --deselect tests/test_sprite_visibility.py::test_all_clips_resume_denied_while_suspended --deselect tests/test_sprite_visibility.py::test_fullscreen_release_while_suspended_keeps_clips_paused --deselect tests/test_sprite_visibility.py::test_restart_clip_clears_stale_pause_so_timer_revives || echo "DIAG-ARM3-EXIT=$?"
 
       # webm 生命周期族（reader/ffmpeg 进程 teardown 竞态）在 macOS CI 上
