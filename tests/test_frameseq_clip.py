@@ -945,3 +945,31 @@ def test_background_warm_on_half_destroyed_clip_degrades_quietly(tmp_path):
     worker.join(5.0)
     assert not worker.is_alive()
     assert errors == [], f"半销毁 clip 的预热不得抛异常：{errors}"
+
+
+def test_dropped_without_close_stays_pinned_for_inflight_delivery(tmp_path):
+    """丢弃未 close 的 clip：clip 与 worker 必须被进程级强钉（在途交付安全落地）。
+
+    崩溃家族根因（mac CI 原生栈实锤）：clip 被 GC 析构时，共享预取线程的在途
+    queued 交付（``_on_loaded`` / ``prefetch``）命中死对象 = UAF 段错误
+    （QThread::exec → sendPostedEvents → qtPythonMetacall，KERN_INVALID_ADDRESS
+    at 0x8）。钉表让"丢弃未收口"路径的对象存活到进程退出，交付安全落地。
+    """
+    import pet.frameseq_clip as fs
+
+    d = tmp_path / "clip"
+    _make_frames(d, count=4)
+    before_c, before_w = len(fs._LIVE_CLIPS), len(fs._LIVE_WORKERS)
+    clip = FrameSeqClip(d)
+    clip.start()
+    clip._request(1)                      # 制造在途交付
+    worker = clip._worker
+    del clip                              # 丢弃，不 close
+    gc.collect()
+    assert len(fs._LIVE_CLIPS) == before_c + 1, "clip 必须入钉表"
+    assert len(fs._LIVE_WORKERS) == before_w + 1, "worker 必须入钉表"
+    assert worker in fs._LIVE_WORKERS
+    # 泵事件让在途交付落地：钉住的对象接管 = 不崩（修复前这里是 UAF 窗口）
+    for _ in range(40):
+        QApplication.processEvents()
+        time.sleep(0.005)
