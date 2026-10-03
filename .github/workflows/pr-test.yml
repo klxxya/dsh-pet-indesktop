@@ -69,6 +69,11 @@ jobs:
       - name: Pytest (main suite)
         run: python -m pytest -v --ignore=tests/test_webm_reader_lifecycle.py --ignore=tests/test_webm_clip_lifecycle.py --ignore=tests/test_webm_first_frame_lock.py --ignore=tests/test_low_priority_warm_interaction_yield.py
 
+      # DIAG v2：mac 只跑 trio（崩点组合）——快迭代钉崩点
+      - name: Pytest (mac trio only, verbose)
+        if: matrix.os == 'macos-latest'
+        run: python -m pytest -v tests/test_overlay_spawn.py tests/test_overlay_lifecycle_gaps.py tests/test_sprite_visibility.py
+
       # webm 生命周期族（reader/ffmpeg 进程 teardown 竞态）在 macOS CI 上
       # 偶发段错误（exit 139，栈在 reader 线程 + imageio LogCatcher）。
       # 段错误会杀掉整个 pytest 进程、拖垮主套件的结果报告，因此拆成
