@@ -878,6 +878,12 @@ class ShellOverlayWindow(OverlayWindow):
 #: QApplication 上漂到进程退出，就是全量套件/macOS CI 漂移段错误的累积源。
 _LIVE_OVERLAY_SHELLS: "weakref.WeakSet" = weakref.WeakSet()
 
+#: 图片解码串行锁（插件首用竞态防线）：Qt 的图片格式插件（dyld 装载 +
+#: QFactoryLoader 缓存）在多线程并发首用下会原生崩溃（mac CI 实锤）；后台
+#: 预热路径统一过它。GUI 线程的同步解码（首帧/跳帧）是既有路径不套它——
+#: 否则预热线程持锁时 GUI 同步解码会被反锁（吞吐倒挂）。
+_IMAGE_DECODE_LOCK = threading.Lock()
+
 
 class OverlayShell(QObject):
     """overlay 拓扑产品壳：主屏 overlay + 主 sprite + 进程级三控制器。
@@ -1981,7 +1987,12 @@ class OverlayShell(QObject):
             for path in pending:
                 if gen != getattr(self, "_self_talk_image_warm_gen", 0):
                     return  # 已换代（清单热改）：旧批结果作废
-                img = QImage(path)
+                # Qt 图片格式插件的首次加载/解码在**并发首用**下不是线程安全的
+                # （mac CI 实锤：多个壳的加载线程并发解码时 dyld/插件初始化竞态
+                # = 原生段错误，dump 里每条崩线都有复数 _load 线程在场）。
+                # 这些线程是后台预热，串行化零代价。
+                with _IMAGE_DECODE_LOCK:
+                    img = QImage(path)
                 if not img.isNull():
                     # 缓存按气泡**实际绘制**尺寸预缩放（显示盒 × 配图大小 ×
                     # DPR × 余量，见 self_talk_image_cache_edge）：存原图是白占
