@@ -570,10 +570,14 @@ def test_retained_frame_is_not_reused_as_frame_zero(tmp_path, decode_probe):
         assert clip._img_frame == 3
 
         decodes = len(decode_probe.calls)
+        hits.clear()                                # 重启后的交付序列从零记起
         assert clip.start() is True
         assert clip.currentImage() is last, "帧 3 留作兜底，直到真帧 0 到货"
         _pump_until(lambda: clip.currentImage() is not last)
-        assert clip.currentFrameNumber() == 0
+        # 时序口径：断言「重启后第一拍交付的是帧 0」而不是「此刻停在帧 0」——
+        # 慢 runner 上帧表可能在断言前又推进了一拍（macOS CI 实测 assert 1==0
+        # 抖动红），交付序列的首元素才是本用例要守的语义。
+        assert hits and hits[0] == 0, "重启后首拍交付必须是帧 0"
         assert len(decode_probe.calls) == decodes + 1, "帧 0 恰好解一次"
         assert decode_probe.calls[-1].endswith("f_0001.webp")
     finally:
