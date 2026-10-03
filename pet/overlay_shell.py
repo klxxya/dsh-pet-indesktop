@@ -1993,6 +1993,9 @@ class OverlayShell(QObject):
                 # 这些线程是后台预热，串行化零代价。锁覆盖解码+缩放+入缓存整段：
                 # 平滑缩放也走 Qt 原生路径（ARM NEON 例程），与解码同样不许并发。
                 with _IMAGE_DECODE_LOCK:
+                    if gen != getattr(self, "_self_talk_image_warm_gen", 0):
+                        return  # 排队等锁期间被换代：一张都不要再解（不占用锁做
+                                # 废功——陈旧线程持锁解大图会把活批次的预热饿死）
                     img = QImage(path)
                     if img.isNull():
                         continue
