@@ -1,0 +1,3 @@
+tests/test_sprite_visibility.py
+tests/test_stream_capture_compat.py
+tests/test_stream_capture_copy.py

@@ -1,0 +1,5 @@
+tests/test_overlay_spawn.py
+tests/test_overlay_lifecycle_gaps.py
+tests/test_sprite_visibility.py
+tests/test_stream_capture_compat.py
+tests/test_stream_capture_copy.py

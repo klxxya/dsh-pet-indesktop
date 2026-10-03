@@ -67,13 +67,26 @@ jobs:
           node integrations/dsh-pet-bridge/verify_import.mjs
 
       - name: Pytest (main suite)
-        run: python -m pytest -q --ignore=tests/test_webm_reader_lifecycle.py --ignore=tests/test_webm_clip_lifecycle.py --ignore=tests/test_webm_first_frame_lock.py --ignore=tests/test_low_priority_warm_interaction_yield.py
+        run: python -m pytest -v --ignore=tests/test_webm_reader_lifecycle.py --ignore=tests/test_webm_clip_lifecycle.py --ignore=tests/test_webm_first_frame_lock.py --ignore=tests/test_low_priority_warm_interaction_yield.py
 
-      # webm 生命周期族（reader/ffmpeg 进程 teardown 竞态）在 macOS CI 上
-      # 偶发段错误（exit 139，栈在 reader 线程 + imageio LogCatcher）。
-      # 段错误会杀掉整个 pytest 进程、拖垮主套件的结果报告，因此拆成
-      # 独立步骤：崩溃时只隔离失败这一步，主套件结果照常产出。
-      # 注意：拆步骤不改变测试内容，不掩盖失败——该红还是红。
+      # DIAG v2：mac 只跑 trio（崩点组合）——快迭代钉崩点
+      - name: Pytest (mac trio only, verbose)
+        if: always() && matrix.os == 'macos-latest'
+        run: python -m pytest -v tests/test_overlay_spawn.py tests/test_overlay_lifecycle_gaps.py tests/test_sprite_visibility.py
+
+      # DIAG v8：visibility 之后是 stream_capture（legacy PetWindow 真控件）——验引爆者
+      - name: Pytest (mac stream duo alone)
+        if: always() && matrix.os == 'macos-latest'
+        run: python -m pytest -q tests/test_stream_capture_compat.py tests/test_stream_capture_copy.py; echo "DIAG-STREAM-EXIT=$?"
+      - name: Pytest (mac vis+stream)
+        if: always() && matrix.os == 'macos-latest'
+        run: python -m pytest -q $(cat diag-quarters/vis_stream.txt); echo "DIAG-VISSTREAM-EXIT=$?"
+      - name: Pytest (mac trio+stream)
+        if: always() && matrix.os == 'macos-latest'
+        run: python -m pytest -q $(cat diag-quarters/trio_stream.txt); echo "DIAG-TRIOSTREAM-EXIT=$?"
+      - name: Pytest (mac Q4+stream)
+        if: always() && matrix.os == 'macos-latest'
+        run: python -m pytest -q $(cat diag-quarters/q4s.txt); echo "DIAG-Q4S-EXIT=$?"
       - name: Pytest (webm lifecycle family, isolated)
         run: python -m pytest -q tests/test_webm_reader_lifecycle.py tests/test_webm_clip_lifecycle.py tests/test_webm_first_frame_lock.py
 
@@ -83,4 +96,22 @@ jobs:
       # 隔离 + 允许一次重跑：重跑仍红才算真失败，避免时序抖动拖垮 PR 门禁。
       - name: Pytest (low-priority warm family, isolated + one retry)
         run: python -m pytest -q tests/test_low_priority_warm_interaction_yield.py || python -m pytest -q tests/test_low_priority_warm_interaction_yield.py
+
+      # frameseq 原生崩溃隔离位：全套件上下文 ~28% 处偶发 Windows access violation，
+      # verbose 复现钉死肇事者为
+      # tests/test_frameseq_clip.py::test_retained_frame_is_not_reused_as_frame_zero
+      # （主线程执行该用例时崩溃、Python 帧链被原生栈破坏；单测 deselect 后全量
+      # 4129 绿 exit=0）。此前归因 watchdog 族系按位置的误判——该族独立/全族均
+      # 全绿，已排除嫌疑，回归主套件。崩溃会杀掉整个 pytest 进程、拖垮主套件
+      # 结果报告，按 webm 族先例隔离；根因排查归 frameseq 批属主。
+      # 隔离不掩盖失败：照跑照判红，只额外给一次重跑机会。
+      # DIAG：mac 段错误后抓系统崩溃报告（.ips 含原生回溯，钉无 Python 帧的崩线程）
+      - name: Dump macOS crash report
+        if: always() && matrix.os == 'macos-latest'
+        run: |
+          sleep 2
+          python3 diag-quarters/dump_crash.py
+
+      - name: Pytest (frameseq native-crash isolates, isolated + one retry)
+        run: python -m pytest -q tests/test_frameseq_prefetch_watchdog.py tests/test_frameseq_clip.py || python -m pytest -q tests/test_frameseq_prefetch_watchdog.py tests/test_frameseq_clip.py
 
