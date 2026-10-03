@@ -888,6 +888,13 @@ _IMAGE_DECODE_LOCK = threading.Lock()
 #: 自言自语配图加载队列（单 worker 串行；见 ``_start_self_talk_image_load``）。
 #: 条目 = (cache, pending, edge, gen, gen_now)；gen_now 回读壳的换代戳。
 _SELF_TALK_LOAD_Q: "queue.Queue" = queue.Queue()
+
+#: 配图解码结果进程级共享（按绝对路径）：同一图片池只解码一次——overlay
+#: 多宠/多壳同池时不再每壳重解一遍（3 宠 = 3 倍解码的浪费就此消除），也
+#: 让测试期"每壳一批次"的队列积压从根上消失。目标长边变化（DPR/配图大小
+#: 热改）时整表清一次重建（与原来每壳各自重建的口径一致，只是范围变全局）。
+_SELF_TALK_IMAGE_CACHE_SHARED: dict = {}
+_SELF_TALK_IMAGE_CACHE_EDGE: "int | None" = None
 _self_talk_loader_started = False
 _self_talk_loader_lock = threading.Lock()
 
@@ -1958,10 +1965,18 @@ class OverlayShell(QObject):
             cache, paths, getattr(self, "_self_talk_image_warm_gen", 0))
 
     def _ensure_self_talk_image_cache(self) -> dict:
+        """配图缓存入口：默认进程级共享表（同池只解一次）；调用方显式设置的
+        独立缓存（测试按需隔离）优先。"""
+        global _SELF_TALK_IMAGE_CACHE_EDGE
         cache = getattr(self, "_self_talk_image_cache", None)
-        if cache is None:
-            cache = self._self_talk_image_cache = {}
-        return cache
+        if cache is not None and cache is not _SELF_TALK_IMAGE_CACHE_SHARED:
+            return cache  # 显式独立缓存（测试隔离）：不动共享表
+        edge = self._self_talk_image_cache_edge()
+        if _SELF_TALK_IMAGE_CACHE_EDGE is not None and _SELF_TALK_IMAGE_CACHE_EDGE != edge:
+            _SELF_TALK_IMAGE_CACHE_SHARED.clear()  # 目标长边变了：整表重建
+        _SELF_TALK_IMAGE_CACHE_EDGE = edge
+        self._self_talk_image_cache = _SELF_TALK_IMAGE_CACHE_SHARED
+        return _SELF_TALK_IMAGE_CACHE_SHARED
 
     def _self_talk_screen_dpr(self) -> float:
         """当前屏 DPR（配图缓存按物理像素定尺寸；读不到按 1.0）。
@@ -2008,7 +2023,8 @@ class OverlayShell(QObject):
             return
         if sig == self._self_talk_image_cache_signature():
             return
-        self._self_talk_image_cache = {}
+        _SELF_TALK_IMAGE_CACHE_SHARED.clear()  # 共享表原位清（其他壳仍持同引用）
+        self._self_talk_image_cache = _SELF_TALK_IMAGE_CACHE_SHARED
         self._self_talk_image_cache_sig = self._self_talk_image_cache_signature()
         self._self_talk_images_checked_at = time.monotonic()
         self._warm_self_talk_images()

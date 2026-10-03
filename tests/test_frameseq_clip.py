@@ -346,12 +346,22 @@ class _PixmapProbe:
 
 
 class _DecodeProbe:
-    """``frameseq_clip.QImage`` 的计数替身：记录"解一帧"（实测 ~1.2ms/帧）的次数。"""
+    """``frameseq_clip.QImage`` 的计数替身：记录"解一帧"（实测 ~1.2ms/帧）的次数。
+
+    计数只认 ``scope``（本用例 tmp_path）下的帧文件：钉表后历史用例遗留的
+    在播 clip 仍在后台推进解码，不收窄口径会把外来解码算进本用例（与
+    test_frame_path_waste 的 H2 教训同款）。
+    """
 
     def __init__(self):
         self.calls: list[str] = []
+        self.scope: str = ""
 
     def __call__(self, path):
+        import os as _os
+        p = _os.path.normcase(str(path))
+        if self.scope and not p.startswith(self.scope):
+            return QImage(path)      # 范围外不计数
         self.calls.append(str(path))
         return QImage(path)
 
@@ -365,9 +375,11 @@ def pixmap_probe(monkeypatch):
 
 
 @pytest.fixture
-def decode_probe(monkeypatch):
+def decode_probe(monkeypatch, tmp_path):
     from pet import frameseq_clip
+    import os as _os
     probe = _DecodeProbe()
+    probe.scope = _os.path.normcase(str(tmp_path))
     monkeypatch.setattr(frameseq_clip, "QImage", probe)
     return probe
 
