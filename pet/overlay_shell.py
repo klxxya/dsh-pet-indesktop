@@ -2758,6 +2758,13 @@ class OverlayShell(QObject):
             except Exception:
                 logging.getLogger(__name__).debug(
                     "测试收口 OverlayShell 失败", exc_info=True)
+            # stop() 对未 start 的壳早退——但它们的配图预热批次照样在加载队列里
+            # 排队，不戳换代戳就会整批解完（队列积压把活批次的预热饿死，CI 实测
+            # 超时）。收口时无条件作废在飞批次。
+            try:
+                shell._cancel_self_talk_image_loads()
+            except Exception:
+                pass
 
     def stop(self) -> None:
         """幂等：重复 stop 是 no-op。
