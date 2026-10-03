@@ -590,8 +590,12 @@ def test_retained_frame_is_not_reused_as_frame_zero(tmp_path, decode_probe):
         # 慢 runner 上帧表可能在断言前又推进了一拍（macOS CI 实测 assert 1==0
         # 抖动红），交付序列的首元素才是本用例要守的语义。
         assert hits and hits[0] == 0, "重启后首拍交付必须是帧 0"
-        assert len(decode_probe.calls) == decodes + 1, "帧 0 恰好解一次"
-        assert decode_probe.calls[-1].endswith("f_0001.webp")
+        # 帧 0 解码计数同理只数「快照之后的帧 0」：第一圈链式预取的帧 1 可能
+        # 在慢 runner 上于快照之后才落账（解码在 worker 线程、计数以调用线程
+        # 为准），把总帧数差钉成 1 会把那次迟到误算进来（macOS CI 实测抖动）。
+        frame0_after = [c for c in decode_probe.calls[decodes:]
+                        if c.endswith("f_0001.webp")]
+        assert len(frame0_after) == 1, "重启后帧 0 恰好解一次"
     finally:
         clip.close()
 
