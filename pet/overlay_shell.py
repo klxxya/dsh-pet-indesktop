@@ -67,6 +67,7 @@ from __future__ import annotations
 import copy
 import logging
 import math
+import queue
 import threading
 import time
 import weakref
@@ -883,6 +884,47 @@ _LIVE_OVERLAY_SHELLS: "weakref.WeakSet" = weakref.WeakSet()
 #: 预热路径统一过它。GUI 线程的同步解码（首帧/跳帧）是既有路径不套它——
 #: 否则预热线程持锁时 GUI 同步解码会被反锁（吞吐倒挂）。
 _IMAGE_DECODE_LOCK = threading.Lock()
+
+#: 自言自语配图加载队列（单 worker 串行；见 ``_start_self_talk_image_load``）。
+#: 条目 = (cache, pending, edge, gen, gen_now)；gen_now 回读壳的换代戳。
+_SELF_TALK_LOAD_Q: "queue.Queue" = queue.Queue()
+_self_talk_loader_started = False
+_self_talk_loader_lock = threading.Lock()
+
+
+def _self_talk_loader_loop() -> None:
+    """配图加载 worker：逐批次逐图串行解码（进程内唯一配图解码线程）。"""
+    while True:
+        item = _SELF_TALK_LOAD_Q.get()
+        if item is None:
+            return  # 收口哨兵（进程退出）
+        cache, pending, edge, gen, gen_now = item
+        for path in pending:
+            if gen != gen_now():
+                break  # 已换代：本批剩余作废
+            with _IMAGE_DECODE_LOCK:
+                if gen != gen_now():
+                    break  # 等锁期间被换代
+                img = QImage(path)
+                if img.isNull():
+                    continue
+                if img.width() > edge or img.height() > edge:
+                    img = img.scaled(
+                        edge, edge,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation)
+                cache[path] = img
+
+
+def _start_self_talk_loader() -> None:
+    """懒起配图加载 worker（幂等；进程级唯一，随进程退出消亡）。"""
+    global _self_talk_loader_started
+    with _self_talk_loader_lock:
+        if _self_talk_loader_started:
+            return
+        _self_talk_loader_started = True
+    threading.Thread(target=_self_talk_loader_loop, daemon=True,
+                     name="self-talk-img-loader").start()
 
 
 class OverlayShell(QObject):
@@ -1887,6 +1929,10 @@ class OverlayShell(QObject):
         self._last_self_talk_text = value
         return self._show_self_talk_text(value)
 
+    def _self_talk_gen_now(self) -> int:
+        """当前配图预热换代戳（加载 worker 的作废判据回读口）。"""
+        return getattr(self, "_self_talk_image_warm_gen", 0)
+
     def _warm_self_talk_images(self, paths=None) -> None:
         """后台线程解码自言自语配图到 ``_self_talk_image_cache``（QImage，
         线程安全）；GUI 侧只取缓存。重复调用靠单个守护线程 + 代次去重。
@@ -1983,36 +2029,12 @@ class OverlayShell(QObject):
         # 整批共用——中途换屏/改配图大小由调用方的签名重建接管。
         edge = self._self_talk_image_cache_edge()
 
-        def _load():
-            for path in pending:
-                if gen != getattr(self, "_self_talk_image_warm_gen", 0):
-                    return  # 已换代（清单热改）：旧批结果作废
-                # Qt 图片格式插件的首次加载/解码在**并发首用**下不是线程安全的
-                # （mac CI 实锤：多个壳的加载线程并发解码时 dyld/插件初始化竞态
-                # = 原生段错误，dump 里每条崩线都有复数 _load 线程在场）。
-                # 这些线程是后台预热，串行化零代价。锁覆盖解码+缩放+入缓存整段：
-                # 平滑缩放也走 Qt 原生路径（ARM NEON 例程），与解码同样不许并发。
-                with _IMAGE_DECODE_LOCK:
-                    if gen != getattr(self, "_self_talk_image_warm_gen", 0):
-                        return  # 排队等锁期间被换代：一张都不要再解（不占用锁做
-                                # 废功——陈旧线程持锁解大图会把活批次的预热饿死）
-                    img = QImage(path)
-                    if img.isNull():
-                        continue
-                    # 缓存按气泡**实际绘制**尺寸预缩放（显示盒 × 配图大小 ×
-                    # DPR × 余量，见 self_talk_image_cache_edge）：存原图是白占
-                    # 内存（24 张原图解码 = 114MB），固定 640 则在小尺寸/1× 屏上
-                    # 多存一倍以上（实测 36.8MB）。只缩不放：小图保留原分辨率。
-                    if img.width() > edge or img.height() > edge:
-                        img = img.scaled(
-                            edge, edge,
-                            Qt.AspectRatioMode.KeepAspectRatio,
-                            Qt.TransformationMode.SmoothTransformation)
-                    cache[path] = img
-
-        import threading
-        threading.Thread(target=_load, daemon=True,
-                         name="self-talk-img-warm").start()
+        # 单 worker 加载队列（取代"每批一条守护线程"）：Qt 图片插件并发首用
+        # 会原生崩溃（mac CI 实锤：每个崩点 dump 都有复数加载线程在场），线程
+        # 攒多了又把全局锁挤爆、把活批次的预热饿死（CI 超时实锤）。单线程串行
+        # = 无并发 + 无雪崩；换代戳逐图复查，作废批次零成本跳过。
+        _start_self_talk_loader()
+        _SELF_TALK_LOAD_Q.put((cache, pending, edge, gen, self._self_talk_gen_now))
 
     def _show_click_self_talk(self, click_name: str = "", sprite=None) -> bool:
         """点击自言自语（``window_alerts.show_click_self_talk`` host 形转发）。
