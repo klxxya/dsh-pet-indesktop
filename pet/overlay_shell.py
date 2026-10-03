@@ -1990,10 +1990,12 @@ class OverlayShell(QObject):
                 # Qt 图片格式插件的首次加载/解码在**并发首用**下不是线程安全的
                 # （mac CI 实锤：多个壳的加载线程并发解码时 dyld/插件初始化竞态
                 # = 原生段错误，dump 里每条崩线都有复数 _load 线程在场）。
-                # 这些线程是后台预热，串行化零代价。
+                # 这些线程是后台预热，串行化零代价。锁覆盖解码+缩放+入缓存整段：
+                # 平滑缩放也走 Qt 原生路径（ARM NEON 例程），与解码同样不许并发。
                 with _IMAGE_DECODE_LOCK:
                     img = QImage(path)
-                if not img.isNull():
+                    if img.isNull():
+                        continue
                     # 缓存按气泡**实际绘制**尺寸预缩放（显示盒 × 配图大小 ×
                     # DPR × 余量，见 self_talk_image_cache_edge）：存原图是白占
                     # 内存（24 张原图解码 = 114MB），固定 640 则在小尺寸/1× 屏上
