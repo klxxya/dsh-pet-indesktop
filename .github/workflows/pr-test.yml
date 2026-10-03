@@ -74,22 +74,23 @@ jobs:
         if: always() && matrix.os == 'macos-latest'
         run: python -m pytest -v tests/test_overlay_spawn.py tests/test_overlay_lifecycle_gaps.py tests/test_sprite_visibility.py
 
-      # DIAG v3：崩溃簇内消融——各拆一条嫌疑用例（独立进程互不影响）
-      - name: Pytest (mac trio minus K3 poison test)
+      # DIAG v5：全量前 80% 按文件四分（各臂独立进程，mac 必崩只断当臂）
+      - name: Pytest (mac quarter Q1)
         if: always() && matrix.os == 'macos-latest'
-        run: python -m pytest -v tests/test_overlay_spawn.py tests/test_overlay_lifecycle_gaps.py tests/test_sprite_visibility.py --deselect tests/test_sprite_visibility.py::test_unbind_while_paused_does_not_poison_clip_for_next_bind || echo "DIAG-ARM1-EXIT=$?"
-      - name: Pytest (mac trio minus pause pair)
+        run: python -m pytest -q $(cat diag-quarters/q1.txt | tr '
+' ' '); echo "DIAG-Q1-EXIT=$?"
+      - name: Pytest (mac quarter Q2)
         if: always() && matrix.os == 'macos-latest'
-        run: python -m pytest -v tests/test_overlay_spawn.py tests/test_overlay_lifecycle_gaps.py tests/test_sprite_visibility.py --deselect tests/test_sprite_visibility.py::test_pause_clip_stops_timer_and_resume_continues_without_rewind --deselect tests/test_sprite_visibility.py::test_pause_clip_is_idempotent_and_noop_without_clip || echo "DIAG-ARM2-EXIT=$?"
-      - name: Pytest (mac trio minus DS2 visibility tests)
+        run: python -m pytest -q $(cat diag-quarters/q2.txt | tr '
+' ' '); echo "DIAG-Q2-EXIT=$?"
+      - name: Pytest (mac quarter Q3)
         if: always() && matrix.os == 'macos-latest'
-        run: python -m pytest -v tests/test_overlay_spawn.py tests/test_overlay_lifecycle_gaps.py tests/test_sprite_visibility.py --deselect tests/test_sprite_visibility.py::test_sprite_show_while_window_hidden_keeps_real_clip_paused --deselect tests/test_sprite_visibility.py::test_all_clips_resume_denied_while_suspended --deselect tests/test_sprite_visibility.py::test_fullscreen_release_while_suspended_keeps_clips_paused --deselect tests/test_sprite_visibility.py::test_restart_clip_clears_stale_pause_so_timer_revives || echo "DIAG-ARM3-EXIT=$?"
-
-      # webm 生命周期族（reader/ffmpeg 进程 teardown 竞态）在 macOS CI 上
-      # 偶发段错误（exit 139，栈在 reader 线程 + imageio LogCatcher）。
-      # 段错误会杀掉整个 pytest 进程、拖垮主套件的结果报告，因此拆成
-      # 独立步骤：崩溃时只隔离失败这一步，主套件结果照常产出。
-      # 注意：拆步骤不改变测试内容，不掩盖失败——该红还是红。
+        run: python -m pytest -q $(cat diag-quarters/q3.txt | tr '
+' ' '); echo "DIAG-Q3-EXIT=$?"
+      - name: Pytest (mac quarter Q4)
+        if: always() && matrix.os == 'macos-latest'
+        run: python -m pytest -q $(cat diag-quarters/q4.txt | tr '
+' ' '); echo "DIAG-Q4-EXIT=$?"
       - name: Pytest (webm lifecycle family, isolated)
         run: python -m pytest -q tests/test_webm_reader_lifecycle.py tests/test_webm_clip_lifecycle.py tests/test_webm_first_frame_lock.py
 
